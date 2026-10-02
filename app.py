@@ -48,22 +48,47 @@ incident_terms = [
     "waiting on repair",
 ]
 
+
 def find_incident_candidates(page_text):
-    """Find report excerpts that may describe a lost-time event."""
+    """Flag likely NPT events using keywords and common DDR wording."""
     lines = page_text.splitlines()
     candidates = []
 
+    terms = [
+        "npt",
+        "malfunction",
+        "failure",
+        "breakdown",
+        "stuck",
+        "lost circulation",
+        "equipment problem",
+        "equipment failure",
+        "washout",
+        "fishing",
+        "repair",
+        "leak",
+        "stalled",
+        "plugged",
+        "damage",
+        "unable to",
+        "power tong",
+        "top drive",
+        "motor failure",
+    ]
+
     for i, line in enumerate(lines):
         matched = [
-            term for term in incident_terms
+            term for term in terms
             if term in line.lower()
         ]
 
         if not matched:
             continue
 
-        start = max(0, i - 1)
-        end = min(len(lines), i + 2)
+        # Include nearby lines because PDF table columns
+        # can be extracted onto separate lines.
+        start = max(0, i - 3)
+        end = min(len(lines), i + 4)
         excerpt = "\n".join(lines[start:end]).strip()
 
         if not excerpt:
@@ -75,7 +100,7 @@ def find_incident_candidates(page_text):
             "Review status": "Needs human review",
         })
 
-    # Avoid showing identical excerpts more than once.
+    # Remove repeated excerpts.
     unique = []
     seen = set()
 
