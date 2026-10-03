@@ -445,163 +445,316 @@ def render_sidebar():
 # ---------------------------------------------------------
 # Page: Executive Dashboard
 # ---------------------------------------------------------
+def _render_dashboard_charts(matrix):
+    """Render result charts directly from the loaded analysis matrix."""
+    if matrix is None or matrix.empty:
+        st.info("Load operation data to generate research graphs.")
+        return
+
+    st.subheader("Research Results — Graphs Generated from Loaded Data")
+    st.caption(
+        "Every chart below is calculated from the currently loaded dataset. "
+        "Filters can be applied in Operation Dataset."
+    )
+
+    # 1. TDLT by well
+    well = (
+        matrix.groupby("Well_ID", as_index=False)
+        .agg(
+            NPT_hr=("Validated_NPT_hr", "sum"),
+            ILT_hr=("Potential_ILT_hr", "sum"),
+            TDLT_hr=("TDLT_hr", "sum"),
+        )
+        .sort_values("TDLT_hr", ascending=False)
+    )
+    st.markdown("**Figure 1 — NPT, Potential ILT and TDLT by Well**")
+    st.bar_chart(
+        well.set_index("Well_ID")[["NPT_hr", "ILT_hr", "TDLT_hr"]],
+        height=360,
+    )
+
+    c1, c2 = st.columns(2)
+
+    # 2. Operation comparison
+    with c1:
+        operation = (
+            matrix.groupby("Operation_Type", as_index=False)
+            .agg(
+                NPT_hr=("Validated_NPT_hr", "sum"),
+                ILT_hr=("Potential_ILT_hr", "sum"),
+                TDLT_hr=("TDLT_hr", "sum"),
+            )
+            .sort_values("TDLT_hr", ascending=False)
+        )
+        st.markdown("**Figure 2 — Lost Time by Operation Type**")
+        st.bar_chart(
+            operation.set_index("Operation_Type")[["NPT_hr", "ILT_hr"]],
+            height=320,
+        )
+
+    # 3. Lost-time composition
+    with c2:
+        composition = pd.DataFrame({
+            "Hours": [
+                matrix["Validated_NPT_hr"].sum(),
+                matrix["Potential_ILT_hr"].sum(),
+            ]
+        }, index=["Validated NPT", "Potential ILT"])
+        st.markdown("**Figure 3 — Overall Lost-Time Composition**")
+        st.bar_chart(composition, height=320)
+
+    # 4. Time trend when dates are valid
+    trend = matrix.copy()
+    trend["Report_Date"] = pd.to_datetime(trend["Report_Date"], errors="coerce")
+    trend = trend.dropna(subset=["Report_Date"])
+    if not trend.empty:
+        trend = (
+            trend.groupby("Report_Date", as_index=True)
+            .agg(
+                NPT_hr=("Validated_NPT_hr", "sum"),
+                ILT_hr=("Potential_ILT_hr", "sum"),
+                TDLT_hr=("TDLT_hr", "sum"),
+            )
+            .sort_index()
+        )
+        st.markdown("**Figure 4 — Lost Time Trend by Report Date**")
+        st.line_chart(trend[["NPT_hr", "ILT_hr", "TDLT_hr"]], height=330)
+    else:
+        st.info("Report_Date could not be interpreted as dates, so the time-trend graph is unavailable.")
+
+    # 5. Root-cause graph where evidence/cause is available
+    evidence_col = next(
+        (
+            c for c in [
+                "Operation_Cause", "Reviewed Cause", "Cause",
+                "Incident / Evidence", "Cause_Evidence", "Incident",
+                "Event_Description", "Description", "Event",
+            ]
+            if c in matrix.columns
+        ),
+        None,
+    )
+    if evidence_col:
+        cause_df = matrix.copy()
+        if evidence_col in {"Operation_Cause", "Reviewed Cause", "Cause"}:
+            cause_df["Cause_Category"] = cause_df[evidence_col].fillna(
+                "Unknown - requires investigation"
+            )
+        else:
+            cause_df["Cause_Category"] = cause_df[evidence_col].apply(classify_cause)
+        cause_summary = (
+            cause_df.groupby("Cause_Category", as_index=False)
+            .agg(
+                NPT_hr=("Validated_NPT_hr", "sum"),
+                ILT_hr=("Potential_ILT_hr", "sum"),
+                TDLT_hr=("TDLT_hr", "sum"),
+                Records=("Well_ID", "count"),
+            )
+            .sort_values("TDLT_hr", ascending=False)
+        )
+        st.markdown("**Figure 5 — TDLT by Cause Category**")
+        st.bar_chart(
+            cause_summary.set_index("Cause_Category")[["NPT_hr", "ILT_hr"]],
+            height=350,
+        )
+        st.dataframe(cause_summary.round(2), use_container_width=True, hide_index=True)
+
+
+def _process_dashboard_dataset(uploaded):
+    """Load a CSV/XLSX from the dashboard and persist the matrix."""
+    if uploaded is None:
+        return
+    try:
+        if uploaded.name.lower().endswith(".csv"):
+            raw = pd.read_csv(uploaded)
+        else:
+            raw = pd.read_excel(uploaded)
+
+        missing = [c for c in REQUIRED if c not in raw.columns]
+        if missing:
+            st.error("Missing required columns: " + ", ".join(missing))
+            st.write("Columns detected:", list(raw.columns))
+            return
+
+        benchmark_mode = "uploaded_or_median"
+        matrix = calculate_matrix(raw, benchmark_mode=benchmark_mode)
+        if "Review_Status" not in matrix.columns:
+            matrix["Review_Status"] = "Requires verification"
+
+        st.session_state.matrix = matrix
+        st.session_state.matrix_source = uploaded.name
+        st.success(f"Dashboard loaded {len(matrix):,} records from {uploaded.name}.")
+    except Exception as error:
+        st.error(f"Could not load dashboard dataset: {error}")
+
+
+def _process_dashboard_pdf(pdf):
+    """Process a PDF from the home dashboard into the DDR review state."""
+    if pdf is None:
+        return
+    try:
+        text = read_pdf(pdf)
+        if not text.strip() or len(text.strip()) < 30:
+            st.error(
+                "The PDF did not yield readable text. If this is a scanned/image-only DDR, "
+                "OCR is required before automatic incident detection."
+            )
+            return
+
+        incidents = detect_incidents(text)
+        st.session_state.ddr_pdf_name = pdf.name
+        st.session_state.ddr_text = text
+        st.session_state.ddr_detected_incidents = incidents
+        st.session_state.ddr_review = None
+        st.session_state.ddr_result = None
+        st.success(
+            f"PDF loaded: {pdf.name}. {len(incidents)} potential incident(s) detected. "
+            "Open DDR PDF Review to confirm them."
+        )
+    except Exception as error:
+        st.error(f"Could not read the PDF: {error}")
+
+
+def _render_ddr_dashboard_results():
+    """Show DDR-derived result cards/charts when a reviewed DDR exists."""
+    result = st.session_state.get("ddr_result")
+    review = st.session_state.get("ddr_review")
+    if result is None:
+        return
+
+    st.subheader("DDR Result — Graphical Summary")
+    row = result.iloc[0]
+    npt = float(row.get("Validated_NPT_hr", 0))
+    ilt = float(row.get("Potential_ILT_hr", 0))
+    tdlt = float(row.get("TDLT_hr", npt + ilt))
+
+    a, b, c = st.columns(3)
+    a.metric("Validated NPT", f"{npt:.2f} hr")
+    b.metric("Potential ILT", f"{ilt:.2f} hr")
+    c.metric("TDLT", f"{tdlt:.2f} hr")
+
+    composition = pd.DataFrame({"Hours": [npt, ilt]}, index=["NPT", "Potential ILT"])
+    st.bar_chart(composition, height=280)
+
+    if review is not None and not review.empty:
+        confirmed = review[review["Confirm as NPT"] == True].copy()
+        if not confirmed.empty:
+            confirmed["Duration (hours)"] = pd.to_numeric(
+                confirmed["Duration (hours)"], errors="coerce"
+            ).fillna(0)
+            st.markdown("**DDR incident durations used in the reviewed NPT total**")
+            st.bar_chart(
+                confirmed.set_index("Incident / Evidence")[["Duration (hours)"]],
+                height=max(260, min(500, 90 * len(confirmed))),
+            )
+
+
 def page_dashboard():
     render_header()
-
     st.markdown(
-        '<span class="status-pill">RESEARCH PROTOTYPE • HUMAN REVIEW REQUIRED</span>',
+        '<span class="status-pill">EXECUTIVE DASHBOARD • DATA-DRIVEN RESULTS</span>',
         unsafe_allow_html=True,
     )
     st.write("")
+
+    # Quick ingestion directly from Home so the supervisor can see the full pipeline.
+    with st.expander("📥 Quick Data Ingestion", expanded=st.session_state.matrix is None):
+        q1, q2 = st.columns(2)
+        with q1:
+            st.markdown("**Operation dataset**")
+            dashboard_data = st.file_uploader(
+                "Upload CSV / Excel",
+                type=["csv", "xlsx"],
+                key="dashboard_dataset_upload",
+                label_visibility="collapsed",
+            )
+            if dashboard_data is not None:
+                _process_dashboard_dataset(dashboard_data)
+        with q2:
+            st.markdown("**Daily Drilling Report**")
+            dashboard_pdf = st.file_uploader(
+                "Upload DDR PDF",
+                type=["pdf"],
+                key="dashboard_pdf_upload",
+                label_visibility="collapsed",
+            )
+            if dashboard_pdf is not None:
+                _process_dashboard_pdf(dashboard_pdf)
+                if st.session_state.get("ddr_detected_incidents") is not None:
+                    st.info("Go to **DDR PDF Review** in the sidebar to confirm NPT and finalize ILT/TDLT.")
 
     matrix = st.session_state.matrix
 
     if matrix is None:
         st.info(
-            "No operation dataset is loaded yet. Use **Operation Dataset** "
-            "in the sidebar to upload your CSV/Excel file. You can also use "
-            "**DDR PDF Review** for single-report analysis."
+            "Upload your operation CSV/Excel above to generate graphs and results. "
+            "The dashboard does not invent research results when no data is loaded."
         )
-
         a, b, c, d = st.columns(4)
         a.metric("Total Actual Hours", "—")
         b.metric("Validated NPT", "—")
         c.metric("Potential ILT", "—")
         d.metric("TDLT", "—")
-
         st.subheader("DrillSense AI workflow")
         st.markdown(
-            """
-            **1. Data → 2. Preprocessing → 3. NPT validation → "
-            **4. ILT benchmark → 5. Unified TDLT → 6. Cause & remedy → "
-            **7. Decision support → 8. Export**
-            """
+            "**Data → Preprocessing → NPT validation → ILT benchmark → Unified TDLT → "
+            "Cause & remedy → Graphs → Decision support → Export**"
         )
-
-        st.warning(
-            "TDLT is only finalized when NPT is validated and an ILT value "
-            "has a documented benchmark/evidence basis."
-        )
+        if st.session_state.get("ddr_result") is not None:
+            _render_ddr_dashboard_results()
         return
 
     total_actual = matrix["Actual_Duration_hr"].sum()
     total_npt = matrix["Validated_NPT_hr"].sum()
     total_ilt = matrix["Potential_ILT_hr"].sum()
     total_tdlt = matrix["TDLT_hr"].sum()
+    lost_pct = (total_tdlt / total_actual * 100) if total_actual else 0
 
-    st.caption(
-        f"Dataset: {st.session_state.matrix_source or 'uploaded data'}"
-    )
+    st.caption(f"Dataset: {st.session_state.matrix_source or 'uploaded data'}")
 
-    a, b, c, d = st.columns(4)
-    a.metric("Total Actual Hours", f"{total_actual:,.1f}")
+    a, b, c, d, e = st.columns(5)
+    a.metric("Actual Hours", f"{total_actual:,.1f}")
     b.metric("Validated NPT", f"{total_npt:,.1f} hr")
     c.metric("Potential ILT", f"{total_ilt:,.1f} hr")
-    d.metric("Total Drilling Lost Time", f"{total_tdlt:,.1f} hr")
+    d.metric("TDLT", f"{total_tdlt:,.1f} hr")
+    e.metric("TDLT / Actual", f"{lost_pct:.1f}%")
 
-    st.caption("TDLT = NPT + Potential ILT")
-
+    st.caption("TDLT = Validated NPT + Potential ILT")
     st.divider()
 
-    left, right = st.columns([1.45, 1])
-
-    with left:
-        st.subheader("Lost Time by Well")
-        well_summary = (
-            matrix.groupby("Well_ID", as_index=False)
-            .agg(
-                NPT_hr=("Validated_NPT_hr", "sum"),
-                ILT_hr=("Potential_ILT_hr", "sum"),
-                TDLT_hr=("TDLT_hr", "sum"),
-            )
-            .sort_values("TDLT_hr", ascending=False)
-            .head(10)
-            .set_index("Well_ID")
-        )
-        st.bar_chart(well_summary[["NPT_hr", "ILT_hr"]])
-
-    with right:
-        st.subheader("Lost Time Composition")
-        composition = pd.DataFrame(
-            {
-                "Hours": [total_npt, total_ilt],
-            },
-            index=["NPT", "Potential ILT"],
-        )
-        st.bar_chart(composition)
-
-        st.caption(
-            "The native Streamlit chart is intentionally simple; the values "
-            "are the research outputs, not a claim that ILT is inherently avoidable."
-        )
+    _render_dashboard_charts(matrix)
 
     st.divider()
-
-    left, right = st.columns(2)
-
-    with left:
-        st.subheader("Operation Summary")
-        operation_summary = (
-            matrix.groupby(
-                ["Operation_Type", "Hole_Section"], as_index=False
-            )
-            .agg(
-                Records=("Well_ID", "count"),
-                Actual_hr=("Actual_Duration_hr", "sum"),
-                NPT_hr=("Validated_NPT_hr", "sum"),
-                ILT_hr=("Potential_ILT_hr", "sum"),
-                TDLT_hr=("TDLT_hr", "sum"),
-            )
-            .sort_values("TDLT_hr", ascending=False)
+    st.subheader("Top Lost-Time Wells")
+    top_wells = (
+        matrix.groupby("Well_ID", as_index=False)
+        .agg(
+            Actual_hr=("Actual_Duration_hr", "sum"),
+            NPT_hr=("Validated_NPT_hr", "sum"),
+            ILT_hr=("Potential_ILT_hr", "sum"),
+            TDLT_hr=("TDLT_hr", "sum"),
         )
-        st.dataframe(
-            operation_summary.round(2),
-            use_container_width=True,
-            hide_index=True,
-        )
+        .sort_values("TDLT_hr", ascending=False)
+    )
+    st.dataframe(top_wells.head(10).round(2), use_container_width=True, hide_index=True)
 
-    with right:
-        st.subheader("Root-Cause Coverage")
-        evidence_col = next(
-            (
-                c for c in [
-                    "Incident / Evidence",
-                    "Cause_Evidence",
-                    "Incident",
-                    "Event_Description",
-                    "Description",
-                    "Event",
-                ]
-                if c in matrix.columns
-            ),
-            None,
-        )
-
-        if evidence_col:
-            tmp = matrix.copy()
-            tmp["Incident / Evidence"] = tmp[evidence_col]
-            tmp["Cause"] = tmp["Incident / Evidence"].apply(classify_cause)
-            cause_summary = (
-                tmp.groupby("Cause")
-                .agg(Records=("Well_ID", "count"), TDLT_hr=("TDLT_hr", "sum"))
-                .sort_values("TDLT_hr", ascending=False)
-            )
-            st.bar_chart(cause_summary[["TDLT_hr"]])
-        else:
-            st.info(
-                "No evidence column is present. Cause analysis requires "
-                "documented incident/evidence text or DDR review."
-            )
+    if st.session_state.get("ddr_result") is not None:
+        st.divider()
+        _render_ddr_dashboard_results()
 
     st.divider()
-    st.subheader("Decision-Support Snapshot")
+    st.subheader("Research Interpretation Panel")
     st.markdown(
-        """
-        - **Validated NPT:** time explicitly reviewed and confirmed as NPT.
-        - **Potential ILT:** time above the selected benchmark after removing NPT.
-        - **TDLT:** NPT + Potential ILT.
-        - **Cause:** preliminary evidence-based category requiring human review.
-        - **Remedy:** decision-support suggestion; follow the approved well-specific procedure.
+        f"""
+        - **Total actual operating time:** {total_actual:,.1f} hr
+        - **Validated NPT:** {total_npt:,.1f} hr
+        - **Potential ILT:** {total_ilt:,.1f} hr
+        - **TDLT:** {total_tdlt:,.1f} hr
+        - **TDLT as a share of actual time:** {lost_pct:.1f}%
+
+        These values are descriptive results from the loaded dataset. Potential ILT is
+        benchmark-relative and should not be interpreted as proven avoidable time without
+        a documented comparable-operation baseline and engineering review.
         """
     )
 
@@ -841,6 +994,10 @@ def page_operation_dataset():
 def page_ddr_review():
     render_header()
     st.header("DDR PDF Review")
+    st.caption(
+        "Upload a Daily Drilling Report, extract its text, confirm potential NPT events, "
+        "document the ILT benchmark basis, and calculate TDLT."
+    )
 
     pdf = st.file_uploader(
         "Upload Daily Drilling Report PDF",
@@ -848,142 +1005,139 @@ def page_ddr_review():
         key="ddr_upload",
     )
 
-    if pdf is None:
+    # Reuse a PDF that was uploaded from the executive dashboard.
+    if pdf is not None:
+        _process_dashboard_pdf(pdf)
+
+    text = st.session_state.get("ddr_text")
+    incidents = st.session_state.get("ddr_detected_incidents")
+
+    if not text:
         st.info(
-            "Upload a DDR PDF. The system will extract text and identify "
-            "potential incidents for human confirmation."
+            "No DDR is loaded. Upload a PDF above or use the Quick Data Ingestion "
+            "area on the Executive Dashboard."
         )
         return
 
-    try:
-        text = read_pdf(pdf)
+    st.success(f"DDR loaded: {st.session_state.get('ddr_pdf_name', 'uploaded PDF')}")
 
-        with st.expander("View extracted report text"):
-            st.text(text[:30000])
+    with st.expander("View extracted DDR text", expanded=False):
+        st.text(text[:40000])
 
-        incidents = detect_incidents(text)
-
-        if not incidents:
-            st.warning(
-                "No potential incidents were automatically detected. "
-                "Review the extracted report text manually."
-            )
-            return
-
-        st.write(
-            "Confirm each event and verify its duration against the original DDR."
+    if not incidents:
+        st.warning(
+            "No potential incidents were automatically detected. This does not prove that "
+            "the DDR contains no NPT. Review the extracted text manually."
         )
+        return
 
-        review = pd.DataFrame(incidents)
+    st.subheader("1. Human Review of Potential NPT")
+    st.write("Confirm or reject each detected event and correct its duration using the original DDR.")
 
-        edited = st.data_editor(
-            review,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic",
-            column_config={
-                "Confirm as NPT": st.column_config.CheckboxColumn(
-                    "Confirm as NPT"
-                ),
-                "Duration (hours)": st.column_config.NumberColumn(
-                    "Duration (hours)", min_value=0.0, step=0.25
-                ),
-            },
-            key="ddr_event_editor",
-        )
-
-        confirmed = edited[edited["Confirm as NPT"] == True].copy()
-        confirmed["Duration (hours)"] = pd.to_numeric(
-            confirmed["Duration (hours)"], errors="coerce"
-        )
-
-        invalid = (
-            confirmed["Duration (hours)"].isna().any()
-            or (confirmed["Duration (hours)"] < 0).any()
-        )
-
-        if invalid:
-            st.error("Confirmed NPT durations must be valid non-negative numbers.")
-            return
-
-        npt = float(confirmed["Duration (hours)"].sum())
-
-        st.subheader("Validated NPT")
-        st.metric("Confirmed NPT", f"{npt:.2f} hr")
-
-        st.subheader("ILT Benchmark and Evidence")
-        st.write(
-            "Enter ILT only after establishing a documented baseline for "
-            "comparable operations. Do not estimate ILT from missing data "
-            "or treat all operating time as lost time."
-        )
-
-        evidence = st.text_area(
-            "Document benchmark, source, and justification",
-            placeholder=(
-                "Example: comparable operation records, reference duration, "
-                "source DDRs, benchmark method, and why the baseline is comparable."
+    review = pd.DataFrame(incidents)
+    edited = st.data_editor(
+        review,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "Confirm as NPT": st.column_config.CheckboxColumn("Confirm as NPT"),
+            "Duration (hours)": st.column_config.NumberColumn(
+                "Duration (hours)", min_value=0.0, step=0.25
             ),
-            key="ddr_ilt_evidence",
+        },
+        key="ddr_event_editor",
+    )
+    st.session_state.ddr_review = edited
+
+    confirmed = edited[edited["Confirm as NPT"] == True].copy()
+    confirmed["Duration (hours)"] = pd.to_numeric(
+        confirmed["Duration (hours)"], errors="coerce"
+    )
+    invalid = confirmed["Duration (hours)"].isna().any() or (confirmed["Duration (hours)"] < 0).any()
+    if invalid:
+        st.error("Confirmed NPT durations must be valid non-negative numbers.")
+        return
+
+    npt = float(confirmed["Duration (hours)"].sum())
+    st.metric("Validated NPT", f"{npt:.2f} hr")
+
+    st.subheader("2. ILT Benchmark and Evidence")
+    st.info(
+        "Enter ILT only after establishing a documented baseline for comparable operations. "
+        "Do not estimate ILT from missing data or treat all operating time as lost time."
+    )
+    evidence = st.text_area(
+        "Benchmark source / method / justification",
+        placeholder=(
+            "Example: comparable operation records, reference duration, source DDRs, "
+            "benchmark method, and why the baseline is comparable."
+        ),
+        key="ddr_ilt_evidence",
+    )
+    ilt = st.number_input(
+        "Validated / reviewed ILT (hours)", min_value=0.0, value=0.0, step=0.25, key="ddr_ilt"
+    )
+
+    if evidence.strip():
+        tdlt = npt + float(ilt)
+        st.subheader("3. Unified Lost-Time Result")
+        x, y, z = st.columns(3)
+        x.metric("NPT", f"{npt:.2f} hr")
+        y.metric("ILT", f"{ilt:.2f} hr")
+        z.metric("TDLT", f"{tdlt:.2f} hr")
+
+        result = pd.DataFrame([{
+            "Report_File": st.session_state.get("ddr_pdf_name", "DDR.pdf"),
+            "Validated_NPT_hr": npt,
+            "Potential_ILT_hr": float(ilt),
+            "TDLT_hr": tdlt,
+            "ILT_Benchmark_Evidence": evidence,
+        }])
+        st.session_state.ddr_result = result
+
+        st.dataframe(result, use_container_width=True, hide_index=True)
+
+        st.subheader("DDR Result Graph")
+        st.bar_chart(
+            pd.DataFrame({"Hours": [npt, float(ilt)]}, index=["NPT", "ILT"]),
+            height=300,
         )
 
-        ilt = st.number_input(
-            "Potential ILT (hours)",
-            min_value=0.0,
-            value=0.0,
-            step=0.25,
-            key="ddr_ilt",
+        if not confirmed.empty:
+            st.subheader("Confirmed NPT Events")
+            st.bar_chart(
+                confirmed.set_index("Incident / Evidence")[["Duration (hours)"]],
+                height=max(280, min(520, 90 * len(confirmed))),
+            )
+
+        st.download_button(
+            "Download TDLT Summary CSV",
+            data=csv_bytes(result),
+            file_name="drillsense_ddr_tdlt_summary.csv",
+            mime="text/csv",
+            key="ddr_summary_download",
+        )
+        st.download_button(
+            "Download Reviewed NPT Events CSV",
+            data=csv_bytes(edited),
+            file_name="drillsense_reviewed_npt.csv",
+            mime="text/csv",
+            key="ddr_npt_download",
         )
 
-        if evidence.strip():
-            tdlt = npt + ilt
-
-            st.subheader("Unified Lost Time Result")
-            x, y, z = st.columns(3)
-            x.metric("NPT", f"{npt:.2f} hr")
-            y.metric("Potential ILT", f"{ilt:.2f} hr")
-            z.metric("TDLT", f"{tdlt:.2f} hr")
-
-            result = pd.DataFrame([{
-                "Report_File": pdf.name,
-                "Validated_NPT_hr": npt,
-                "Potential_ILT_hr": ilt,
-                "TDLT_hr": tdlt,
-                "ILT_Benchmark_Evidence": evidence,
-            }])
-
-            st.session_state.ddr_review = edited
-            st.session_state.ddr_result = result
-
-            st.dataframe(result, use_container_width=True, hide_index=True)
-
-            st.download_button(
-                "Download TDLT Summary CSV",
-                data=csv_bytes(result),
-                file_name="drillsense_ddr_tdlt_summary.csv",
-                mime="text/csv",
-                key="ddr_summary_download",
-            )
-            st.download_button(
-                "Download Reviewed NPT Events CSV",
-                data=csv_bytes(edited),
-                file_name="drillsense_reviewed_npt.csv",
-                mime="text/csv",
-                key="ddr_npt_download",
-            )
-
-            cause_data = edited[edited["Confirm as NPT"] == True].copy()
-            if not cause_data.empty:
-                st.subheader("Incident Cause Review")
-                show_root_cause_analysis(cause_data, "ddr_cause")
-        else:
-            st.info(
-                "Enter documented benchmark evidence before finalizing the "
-                "combined TDLT result."
-            )
-
-    except Exception as error:
-        st.error(f"Could not read the PDF: {error}")
+        if not confirmed.empty:
+            st.subheader("4. Incident Cause Review")
+            cause_data = confirmed.copy()
+            cause_data["Incident / Evidence"] = cause_data["Incident / Evidence"].astype(str)
+            edited_causes = show_root_cause_analysis(cause_data, "ddr_cause")
+            if edited_causes is not None:
+                st.session_state.root_cause_data = edited_causes
+    else:
+        st.warning(
+            "TDLT is not finalized. Enter a documented ILT benchmark/evidence basis before "
+            "finalizing the combined total."
+        )
 
 
 # ---------------------------------------------------------
