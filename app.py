@@ -1,631 +1,554 @@
 
+import io
 import re
-from io import BytesIO
-
 import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
-
-# ==================================================
-# PAGE SETUP
-# ==================================================
-
 st.set_page_config(
     page_title="DrillSense AI",
     page_icon="🛢️",
-    layout="wide",
+    layout="wide"
 )
 
 st.title("🛢️ DrillSense AI")
+st.subheader("Unified Lost Time Quantification Matrix")
 st.caption("Drilling Performance & Lost Time Intelligence")
 st.info("Core equation: TDLT = NPT + ILT")
 
+st.write(
+    "DrillSense AI combines Non-Productive Time (NPT) and "
+    "Invisible Lost Time (ILT) in one matrix for drilling "
+    "performance analysis."
+)
 
-# ==================================================
-# INCIDENT DETECTION
-# ==================================================
+REQUIRED = [
+    "Well_ID",
+    "Report_Date",
+    "Operation_Type",
+    "Hole_Section",
+    "Actual_Duration_hr",
+    "Validated_NPT_hr",
+]
 
-INCIDENT_TERMS = [
-    "npt",
-    "malfunction",
-    "failure",
-    "breakdown",
-    "stuck",
-    "lost circulation",
-    "equipment problem",
-    "equipment failure",
-    "washout",
-    "fishing",
-    "repair",
-    "leak",
-    "stalled",
-    "plugged",
-    "damage",
-    "unable to",
-    "power tong",
-    "top drive",
-    "motor failure",
-    "motor/vfd",
-    "motor vfd",
+KEYWORDS = [
+    "malfunction", "failure", "breakdown", "stuck",
+    "lost circulation", "equipment problem",
+    "equipment failure", "washout", "fishing",
+    "repair", "leak", "stalled", "plugged",
+    "damage", "unable to", "power tong",
+    "top drive", "motor failure", "motor/vfd",
+    "motor vfd", "npt"
 ]
 
 
-def find_incident_candidates(page_text, page_number):
-    """Find potential incidents, including terms split by PDF line breaks."""
+def read_pdf(uploaded_file):
+    reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
+    pages = []
+    for number, page in enumerate(reader.pages, start=1):
+        pages.append(
+            f"PAGE {number}\n{page.extract_text() or ''}"
+        )
+    return "\n".join(pages)
 
-    lines = page_text.splitlines()
-    normalized = re.sub(r"\s+", " ", page_text.lower())
-    candidates = []
+
+def detect_incidents(text):
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    incidents = []
     seen = set()
 
-    for term in INCIDENT_TERMS:
-        pattern = re.escape(term).replace(r"\ ", r"\s+")
-        for match in re.finditer(pattern, normalized):
-            start = max(0, match.start() - 180)
-            end = min(len(normalized), match.end() + 220)
-            excerpt = normalized[start:end].strip()
+    for i, line in enumerate(lines):
+        if not any(k in line.lower() for k in KEYWORDS):
+            continue
 
-            # Recover readable context from the original page.
-            # Use nearby lines containing the matched term.
-            matching_line = None
-            for i, line in enumerate(lines):
-                if re.search(pattern, line.lower()):
-                    matching_line = i
-                    break
+        context = " | ".join(
+            lines[max(0, i - 1):min(len(lines), i + 2)]
+        )
 
-            if matching_line is not None:
-                line_start = max(0, matching_line - 4)
-                line_end = min(len(lines), matching_line + 5)
-                excerpt = "\n".join(
-                    lines[line_start:line_end]
-                ).strip()
+        if context in seen:
+            continue
+        seen.add(context)
 
-            key = (page_number, excerpt.lower())
-            if key in seen:
-                continue
-            seen.add(key)
+        duration = 0.0
 
-            # Look for a nearby explicit duration.
-            duration = 0.0
-            duration_match = re.search(
-                r"(\d+(?:\.\d+)?)\s*"
-                r"(?:hours?|hrs?|hr\b)",
-                excerpt,
-                re.IGNORECASE,
-            )
+        hour_match = re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:hours|hour|hrs|hr)\b",
+            context,
+            re.IGNORECASE
+        )
 
-            if not duration_match:
-                duration_match = re.search(
-                    r"(\d+(?:\.\d+)?)\s+WFD\b",
-                    excerpt,
-                    re.IGNORECASE,
-                )
+        time_match = re.search(
+            r"(\d{1,2}:\d{2})\s*(?:to|-)\s*(\d{1,2}:\d{2})",
+            context,
+            re.IGNORECASE
+        )
 
-            if duration_match:
-                duration = float(duration_match.group(1))
+        if hour_match:
+            duration = float(hour_match.group(1))
+        elif time_match:
+            def minutes(value):
+                h, m = map(int, value.split(":"))
+                return h * 60 + m
 
-            candidates.append({
-                "Page": page_number,
-                "Matched terms": term,
-                "Report excerpt": excerpt,
-                "Confirm as NPT": False,
-                "Duration (hours)": duration,
-                "Review status": "Needs human review",
-            })
+            start = minutes(time_match.group(1))
+            end = minutes(time_match.group(2))
 
-    return candidates
+            if end < start:
+                end += 24 * 60
 
+            duration = (end - start) / 60
 
-def extract_pdf(uploaded_file):
-    reader = PdfReader(uploaded_file)
-    pages = []
-
-    for number, page in enumerate(reader.pages, start=1):
-        pages.append({
-            "Page": number,
-            "Text": page.extract_text() or "",
+        incidents.append({
+            "Confirm as NPT": False,
+            "Incident / Evidence": context,
+            "Duration (hours)": duration,
         })
 
-    return pages
+    return incidents
 
 
-def find_reported_npt_totals(text):
-    """Extract explicit NPT totals when their wording is recognizable."""
+def calculate_matrix(data):
+    df = data.copy()
 
-    patterns = [
-        r"total\s+npt\s+to\s+date\s*[:\-]?\s*"
-        r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|hr\b)",
+    for col in ["Actual_Duration_hr", "Validated_NPT_hr"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        r"npt\s+today\s*[:\-]?\s*"
-        r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|hr\b)",
-    ]
+    if df[["Actual_Duration_hr", "Validated_NPT_hr"]].isna().any().any():
+        raise ValueError(
+            "Actual_Duration_hr and Validated_NPT_hr must contain numbers."
+        )
 
-    totals = []
+    if (df["Actual_Duration_hr"] < 0).any():
+        raise ValueError("Actual durations cannot be negative.")
 
-    for pattern in patterns:
-        for match in re.finditer(
-            pattern, text, re.IGNORECASE
-        ):
-            totals.append({
-                "Label": (
-                    "Total NPT to date"
-                    if "total" in pattern
-                    else "NPT today"
-                ),
-                "Reported hours": float(match.group(1)),
-                "Source text": match.group(0),
-            })
+    if (df["Validated_NPT_hr"] < 0).any():
+        raise ValueError("NPT durations cannot be negative.")
 
-    return totals
+    if (
+        df["Validated_NPT_hr"] > df["Actual_Duration_hr"]
+    ).any():
+        raise ValueError(
+            "NPT cannot exceed the actual operation duration."
+        )
+
+    # Remove validated NPT before estimating excess operation time.
+    df["Adjusted_Duration_hr"] = (
+        df["Actual_Duration_hr"] - df["Validated_NPT_hr"]
+    )
+
+    # Benchmark comparable operations by operation type and hole section.
+    df["Benchmark_Duration_hr"] = (
+        df.groupby(["Operation_Type", "Hole_Section"])
+        ["Adjusted_Duration_hr"]
+        .transform("median")
+    )
+
+    # Potential ILT is adjusted duration above the benchmark.
+    df["Potential_ILT_hr"] = (
+        df["Adjusted_Duration_hr"] - df["Benchmark_Duration_hr"]
+    ).clip(lower=0)
+
+    # Unified total.
+    df["TDLT_hr"] = (
+        df["Validated_NPT_hr"] + df["Potential_ILT_hr"]
+    )
+
+    return df
 
 
-# ==================================================
-# FILE UPLOAD
-# ==================================================
+def csv_bytes(data):
+    return data.to_csv(index=False).encode("utf-8")
 
-st.header("1. Upload Drilling Report")
 
-uploaded_file = st.file_uploader(
-    "Select a DDR or drilling dataset",
-    type=["pdf", "csv", "xlsx"],
+# ======================================================
+# WORKFLOW 1: UNIFIED MATRIX FROM CSV / EXCEL
+# ======================================================
+
+st.header("1. Unified NPT–ILT Matrix")
+
+mode = st.radio(
+    "Choose your workflow",
+    ["Operation Dataset (CSV / Excel)", "DDR PDF Review"],
+    horizontal=True
 )
 
-if uploaded_file is None:
-    st.info("Supported files: PDF, CSV, and Excel (.xlsx).")
-    st.stop()
+if mode == "Operation Dataset (CSV / Excel)":
 
-
-filename = uploaded_file.name.lower()
-
-# Keep the report's extracted text available for review.
-full_text = ""
-all_candidates = []
-reported_totals = []
-
-
-try:
-    # --------------------------------------------------
-    # PDF WORKFLOW
-    # --------------------------------------------------
-
-    if filename.endswith(".pdf"):
-        pages = extract_pdf(uploaded_file)
-
-        full_text = "\n\n".join(
-            f"--- PAGE {page['Page']} ---\n{page['Text']}"
-            for page in pages
-        )
-
-        st.success(
-            f"PDF processed: {len(pages)} page(s)."
-        )
-
-        col1, col2 = st.columns(2)
-        col1.metric("PDF Pages", len(pages))
-        col2.metric("Extracted Characters", len(full_text))
-
-        st.download_button(
-            "Download Extracted Text",
-            data=full_text.encode("utf-8"),
-            file_name="drilling_report_extracted.txt",
-            mime="text/plain",
-        )
-
-        with st.expander("View extracted report text"):
-            for page in pages:
-                st.markdown(f"**Page {page['Page']}**")
-                if page["Text"].strip():
-                    st.text(page["Text"])
-                else:
-                    st.warning(
-                        "No selectable text found on this page. "
-                        "OCR may be required."
-                    )
-
-        for page in pages:
-            all_candidates.extend(
-                find_incident_candidates(
-                    page["Text"], page["Page"]
-                )
-            )
-
-        reported_totals = find_reported_npt_totals(
-            full_text
-        )
-
-    # --------------------------------------------------
-    # CSV / EXCEL WORKFLOW
-    # --------------------------------------------------
-
-    else:
-        if filename.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-
-        st.success("Spreadsheet opened successfully.")
-
-        st.subheader("Spreadsheet Preview")
-        st.dataframe(df.head(50), use_container_width=True)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Records", len(df))
-        col2.metric("Columns", len(df.columns))
-        col3.metric(
-            "Duplicate Rows",
-            int(df.duplicated().sum()),
-        )
-
-        quality = pd.DataFrame({
-            "Column": df.columns,
-            "Data Type": [
-                str(df[column].dtype) for column in df.columns
-            ],
-            "Missing Values": [
-                int(df[column].isna().sum())
-                for column in df.columns
-            ],
-            "Missing (%)": [
-                round(df[column].isna().mean() * 100, 2)
-                for column in df.columns
-            ],
-        })
-
-        st.subheader("Data Quality Report")
-        st.dataframe(quality, use_container_width=True)
-
-        st.download_button(
-            "Download Spreadsheet as CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="drilling_data_export.csv",
-            mime="text/csv",
-        )
-
-        st.warning(
-            "Spreadsheet data is displayed for inspection. "
-            "Automatic NPT/ILT calculation from arbitrary "
-            "spreadsheet columns is not enabled because column "
-            "meanings and time units must first be validated."
-        )
-
-        st.stop()
-
-
-    # ==================================================
-    # HUMAN REVIEW
-    # ==================================================
-
-    st.divider()
-    st.header("2. Review Potential NPT Events")
-
-    st.write(
-        "Review each excerpt against the original DDR. "
-        "Check 'Confirm as NPT' only when the event and its "
-        "duration have been verified. Edit durations as needed."
+    uploaded = st.file_uploader(
+        "Upload your operation dataset",
+        type=["csv", "xlsx"]
     )
 
-    if not all_candidates:
-        st.warning(
-            "No configured incident terms were detected. "
-            "This does not prove that no NPT occurred."
-        )
-
-        st.info(
-            "Review the extracted text manually. A reviewer "
-            "can only calculate NPT for incidents entered "
-            "and validated in the review table."
-        )
-
-        review_df = pd.DataFrame(columns=[
-            "Page",
-            "Matched terms",
-            "Report excerpt",
-            "Confirm as NPT",
-            "Duration (hours)",
-            "Review status",
-        ])
-
-    else:
-        review_df = pd.DataFrame(all_candidates)
-
-        # Prevent duplicated candidates from appearing as
-        # separate events when their excerpts overlap.
-        review_df = review_df.drop_duplicates(
-            subset=["Page", "Report excerpt"]
-        ).reset_index(drop=True)
-
-    edited_df = st.data_editor(
-        review_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="incident_review_editor",
-        column_config={
-            "Page": st.column_config.NumberColumn(
-                "PDF page", disabled=True
-            ),
-            "Matched terms": st.column_config.TextColumn(
-                "Detected term", disabled=True
-            ),
-            "Report excerpt": st.column_config.TextColumn(
-                "Original report excerpt", disabled=True,
-                width="large",
-            ),
-            "Confirm as NPT": st.column_config.CheckboxColumn(
-                "Confirm as NPT",
-                help="Tick only after checking the original report.",
-            ),
-            "Duration (hours)": st.column_config.NumberColumn(
-                "Duration (hours)",
-                min_value=0.0,
-                step=0.25,
-                format="%.2f",
-            ),
-            "Review status": st.column_config.TextColumn(
-                "Status", disabled=True
-            ),
-        },
+    st.caption(
+        "Required columns: Well_ID, Report_Date, Operation_Type, "
+        "Hole_Section, Actual_Duration_hr, Validated_NPT_hr"
     )
 
-    # ==================================================
-    # VALIDATE REVIEWED EVENTS
-    # ==================================================
-
-    st.divider()
-    st.header("3. Validated NPT Calculation")
-
-    if "Confirm as NPT" not in edited_df.columns:
-        edited_df["Confirm as NPT"] = False
-
-    if "Duration (hours)" not in edited_df.columns:
-        edited_df["Duration (hours)"] = 0.0
-
-    edited_df["Duration (hours)"] = pd.to_numeric(
-        edited_df["Duration (hours)"],
-        errors="coerce",
-    )
-
-    confirmed = edited_df[
-        edited_df["Confirm as NPT"].fillna(False)
-    ].copy()
-
-    invalid_durations = confirmed[
-        confirmed["Duration (hours)"].isna()
-        | (confirmed["Duration (hours)"] <= 0)
-    ]
-
-    if not invalid_durations.empty:
-        st.error(
-            "One or more confirmed events have missing or "
-            "non-positive durations. Correct them before "
-            "calculating NPT."
-        )
-        npt_valid = False
-        validated_npt = None
-    else:
-        npt_valid = True
-        validated_npt = float(
-            confirmed["Duration (hours)"].sum()
-        )
-
-    col1, col2 = st.columns(2)
-    col1.metric("Detected Candidates", len(edited_df))
-    col2.metric("Confirmed NPT Events", len(confirmed))
-
-    if npt_valid:
-        st.metric(
-            "Validated NPT (hours)",
-            f"{validated_npt:.2f}",
-        )
-
-    # ==================================================
-    # DISCREPANCY WARNINGS
-    # ==================================================
-
-    st.header("4. Report Discrepancy Checks")
-
-    if reported_totals:
-        totals_df = pd.DataFrame(reported_totals)
-
-        st.write("NPT totals extracted from the report:")
-        st.dataframe(totals_df, use_container_width=True)
-
-        if npt_valid:
-            for item in reported_totals:
-                reported = item["Reported hours"]
-
-                # A report total may be a daily value or a
-                # cumulative value; compare only like-for-like
-                # values after the reviewer verifies the scope.
-                if (
-                    item["Label"] == "Total NPT to date"
-                    and abs(reported - validated_npt) > 0.01
-                ):
-                    st.warning(
-                        f"Discrepancy: report says total NPT "
-                        f"to date is {reported:.2f} hours, while "
-                        f"the currently confirmed event durations "
-                        f"sum to {validated_npt:.2f} hours. "
-                        "Verify reporting period, omitted events, "
-                        "and source values before finalizing."
-                    )
-
-                elif (
-                    item["Label"] == "NPT today"
-                    and abs(reported - validated_npt) > 0.01
-                ):
-                    st.warning(
-                        f"Possible discrepancy: report says "
-                        f"NPT today is {reported:.2f} hours, "
-                        f"while confirmed events sum to "
-                        f"{validated_npt:.2f} hours. These values "
-                        "may cover different reporting scopes; "
-                        "verify before reconciling."
-                    )
-    else:
-        st.info(
-            "No recognizable NPT summary total was extracted. "
-            "Check the original report for any stated NPT totals."
-        )
-
-    st.warning(
-        "Automated discrepancy checks are indicators for review, "
-        "not proof of an error. Confirm that compared values cover "
-        "the same reporting period and use the same definitions."
-    )
-
-    # ==================================================
-    # ILT INPUT AND TDLT
-    # ==================================================
-
-    st.divider()
-    st.header("5. ILT and Total Drilling Lost Time")
-
-    st.write(
-        "Enter ILT only after establishing a documented baseline "
-        "for comparable operations. Do not estimate ILT from "
-        "missing data or treat all operating time as lost time."
-    )
-
-    ilt_text = st.text_input(
-        "Validated ILT (hours)",
-        value="",
-        placeholder="e.g. 1.25",
-        key="ilt_hours",
-    )
-
-    ilt_basis = st.text_input(
-        "ILT baseline / method / evidence",
-        value="",
-        placeholder=(
-            "e.g. approved benchmark, planned duration, "
-            "or documented calculation method"
-        ),
-        key="ilt_basis",
-    )
-
-    ilt_hours = None
-    ilt_valid = False
-
-    if ilt_text.strip():
+    if uploaded is not None:
         try:
-            ilt_hours = float(ilt_text)
-
-            if ilt_hours < 0:
-                st.error("ILT cannot be negative.")
-            elif not ilt_basis.strip():
-                st.warning(
-                    "Provide the ILT baseline or method before "
-                    "using this value in TDLT."
-                )
+            if uploaded.name.lower().endswith(".csv"):
+                raw = pd.read_csv(uploaded)
             else:
-                ilt_valid = True
+                raw = pd.read_excel(uploaded)
 
-        except ValueError:
-            st.error(
-                "Enter ILT as a valid number of hours, "
-                "for example 1.25."
-            )
+            missing = [c for c in REQUIRED if c not in raw.columns]
 
-    if npt_valid and ilt_valid:
-        tdlt = validated_npt + ilt_hours
+            if missing:
+                st.error(
+                    "The dataset is missing required columns: "
+                    + ", ".join(missing)
+                )
+                st.write("Columns detected:", list(raw.columns))
+                st.dataframe(raw.head(50), use_container_width=True)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("NPT (hours)", f"{validated_npt:.2f}")
-        col2.metric("ILT (hours)", f"{ilt_hours:.2f}")
-        col3.metric("TDLT (hours)", f"{tdlt:.2f}")
+            elif raw[
+                ["Well_ID", "Operation_Type", "Hole_Section"]
+            ].isna().any().any():
+                st.error(
+                    "Well_ID, Operation_Type, and Hole_Section "
+                    "must not be blank."
+                )
 
-        st.success(
-            f"TDLT = {validated_npt:.2f} + "
-            f"{ilt_hours:.2f} = {tdlt:.2f} hours"
-        )
-    else:
-        st.info(
-            "TDLT is not finalized. Confirm valid NPT durations "
-            "and enter a validated ILT value with its documented "
-            "basis to calculate the total."
-        )
-        tdlt = None
+            else:
+                is_synthetic = (
+                    "Source_Reference" in raw.columns
+                    and "Review_Status" in raw.columns
+                )
 
-    # ==================================================
-    # DOWNLOAD REVIEW RESULTS
-    # ==================================================
+                if is_synthetic:
+                    st.warning(
+                        "SYNTHETIC DEMONSTRATION MODE: These records "
+                        "are simulated. Results do not represent actual "
+                        "field performance or validated Lower Indus "
+                        "Basin measurements."
+                    )
+                else:
+                    st.info(
+                        "Structured data detected. Verify source records, "
+                        "time units, NPT labels, and benchmark suitability."
+                    )
 
-    st.divider()
-    st.header("6. Export Review Results")
+                matrix = calculate_matrix(raw)
 
-    export_df = edited_df.copy()
+                if "Review_Status" not in matrix.columns:
+                    matrix["Review_Status"] = "Requires verification"
 
-    if "Review status" in export_df.columns:
-        export_df["Review status"] = export_df[
-            "Confirm as NPT"
-        ].fillna(False).map({
-            True: "Confirmed by reviewer",
-            False: "Not confirmed",
-        })
+                st.header("2. Filter the Matrix")
 
-    export_df["Validated NPT total (hours)"] = (
-        validated_npt if npt_valid else None
+                col1, col2, col3 = st.columns(3)
+
+                wells = sorted(matrix["Well_ID"].astype(str).unique())
+                operations = sorted(
+                    matrix["Operation_Type"].astype(str).unique()
+                )
+                sections = sorted(
+                    matrix["Hole_Section"].astype(str).unique()
+                )
+
+                with col1:
+                    chosen_wells = st.multiselect(
+                        "Well",
+                        wells,
+                        default=wells
+                    )
+
+                with col2:
+                    chosen_operations = st.multiselect(
+                        "Operation",
+                        operations,
+                        default=operations
+                    )
+
+                with col3:
+                    chosen_sections = st.multiselect(
+                        "Hole section",
+                        sections,
+                        default=sections
+                    )
+
+                view = matrix[
+                    matrix["Well_ID"].astype(str).isin(chosen_wells)
+                    & matrix["Operation_Type"].astype(str).isin(
+                        chosen_operations
+                    )
+                    & matrix["Hole_Section"].astype(str).isin(
+                        chosen_sections
+                    )
+                ].copy()
+
+                st.header("3. Lost Time Results")
+
+                npt_total = view["Validated_NPT_hr"].sum()
+                ilt_total = view["Potential_ILT_hr"].sum()
+                tdlt_total = view["TDLT_hr"].sum()
+
+                a, b, c, d = st.columns(4)
+                a.metric("Operation Records", len(view))
+                b.metric("NPT (hours)", f"{npt_total:.2f}")
+                c.metric("Potential ILT (hours)", f"{ilt_total:.2f}")
+                d.metric("TDLT (hours)", f"{tdlt_total:.2f}")
+
+                st.caption(
+                    "Potential ILT is benchmark-based and requires "
+                    "technical review. It is not automatically proof "
+                    "that all excess time was avoidable."
+                )
+
+                st.header("4. Unified Quantification Matrix")
+
+                display_cols = [
+                    "Well_ID",
+                    "Report_Date",
+                    "Operation_Type",
+                    "Hole_Section",
+                    "Actual_Duration_hr",
+                    "Validated_NPT_hr",
+                    "Adjusted_Duration_hr",
+                    "Benchmark_Duration_hr",
+                    "Potential_ILT_hr",
+                    "TDLT_hr",
+                    "Review_Status",
+                ]
+
+                display_cols = [
+                    c for c in display_cols if c in view.columns
+                ]
+
+                st.dataframe(
+                    view[display_cols].round(2),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.header("5. Calculation Method")
+
+                st.latex(
+                    r"\text{Adjusted Duration} = "
+                    r"\text{Actual Duration} - \text{NPT}"
+                )
+
+                st.latex(
+                    r"\text{Potential ILT} = "
+                    r"\max(0,\text{Adjusted Duration} - \text{Benchmark})"
+                )
+
+                st.latex(
+                    r"\text{TDLT} = \text{NPT} + \text{Potential ILT}"
+                )
+
+                st.write(
+                    "The benchmark is the median adjusted duration "
+                    "for records with the same operation type and "
+                    "hole section in the uploaded dataset."
+                )
+
+                st.header("6. Operation Summary")
+
+                summary = (
+                    view.groupby(
+                        ["Operation_Type", "Hole_Section"],
+                        as_index=False
+                    )
+                    .agg(
+                        Record_Count=("Well_ID", "count"),
+                        Actual_Duration_hr=("Actual_Duration_hr", "sum"),
+                        Validated_NPT_hr=("Validated_NPT_hr", "sum"),
+                        Potential_ILT_hr=("Potential_ILT_hr", "sum"),
+                        TDLT_hr=("TDLT_hr", "sum"),
+                    )
+                )
+
+                st.dataframe(
+                    summary.round(2),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                if not summary.empty:
+                    chart = summary.set_index("Operation_Type")[
+                        ["Validated_NPT_hr", "Potential_ILT_hr"]
+                    ]
+                    st.bar_chart(chart)
+
+                st.header("7. Download Results")
+
+                st.download_button(
+                    "Download Unified Matrix CSV",
+                    data=csv_bytes(view),
+                    file_name="drillsense_unified_matrix.csv",
+                    mime="text/csv"
+                )
+
+                st.download_button(
+                    "Download Operation Summary CSV",
+                    data=csv_bytes(summary),
+                    file_name="drillsense_operation_summary.csv",
+                    mime="text/csv"
+                )
+
+        except Exception as error:
+            st.error(f"Could not process the dataset: {error}")
+
+
+# ======================================================
+# WORKFLOW 2: DDR PDF REVIEW
+# ======================================================
+
+else:
+
+    st.header("DDR PDF Incident Review")
+
+    pdf = st.file_uploader(
+        "Upload a Daily Drilling Report PDF",
+        type=["pdf"]
     )
-    export_df["ILT (hours)"] = (
-        ilt_hours if ilt_valid else None
-    )
-    export_df["ILT basis"] = ilt_basis.strip() or None
-    export_df["TDLT (hours)"] = tdlt
 
-    export_df["Calculation note"] = (
-        "Human review required; verify source report "
-        "and reporting scope."
-    )
+    if pdf is not None:
+        try:
+            text = read_pdf(pdf)
 
-    st.download_button(
-        "Download Reviewed Events CSV",
-        data=export_df.to_csv(index=False).encode("utf-8"),
-        file_name="drillsense_review_results.csv",
-        mime="text/csv",
-    )
+            with st.expander("View extracted PDF text"):
+                st.text(text[:20000])
 
-    summary_df = pd.DataFrame([
-        {"Metric": "Confirmed NPT events", "Value": len(confirmed)},
-        {
-            "Metric": "Validated NPT (hours)",
-            "Value": validated_npt if npt_valid else "Not valid",
-        },
-        {
-            "Metric": "ILT (hours)",
-            "Value": ilt_hours if ilt_valid else "Not validated",
-        },
-        {
-            "Metric": "ILT basis",
-            "Value": ilt_basis.strip() or "Not provided",
-        },
-        {
-            "Metric": "TDLT (hours)",
-            "Value": tdlt if tdlt is not None else "Not calculated",
-        },
-    ])
+            incidents = detect_incidents(text)
 
-    st.download_button(
-        "Download Calculation Summary CSV",
-        data=summary_df.to_csv(index=False).encode("utf-8"),
-        file_name="drillsense_calculation_summary.csv",
-        mime="text/csv",
-    )
+            if not incidents:
+                st.warning(
+                    "No potential incidents were automatically detected. "
+                    "This does not prove that the report contains no NPT. "
+                    "Review the extracted text manually."
+                )
 
-except Exception as error:
-    st.error(f"Could not process this file: {error}")
-    st.info(
-        "Check that the file is valid. Scanned PDFs may require "
-        "OCR, and password-protected PDFs may not be readable."
-    )
+            else:
+                st.write(
+                    "Review every detected event against the original DDR."
+                )
+
+                review = pd.DataFrame(incidents)
+
+                edited = st.data_editor(
+                    review,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="dynamic",
+                    column_config={
+                        "Confirm as NPT": st.column_config.CheckboxColumn(
+                            "Confirm as NPT"
+                        ),
+                        "Duration (hours)": st.column_config.NumberColumn(
+                            "Duration (hours)",
+                            min_value=0.0,
+                            step=0.25
+                        ),
+                    }
+                )
+
+                confirmed = edited[
+                    edited["Confirm as NPT"] == True
+                ].copy()
+
+                confirmed["Duration (hours)"] = pd.to_numeric(
+                    confirmed["Duration (hours)"],
+                    errors="coerce"
+                )
+
+                invalid = (
+                    confirmed["Duration (hours)"].isna().any()
+                    or (confirmed["Duration (hours)"] < 0).any()
+                )
+
+                if invalid:
+                    st.error(
+                        "Confirmed NPT durations must be valid "
+                        "non-negative numbers."
+                    )
+                    st.stop()
+
+                npt = confirmed["Duration (hours)"].sum()
+
+                st.metric("Confirmed NPT (hours)", f"{npt:.2f}")
+
+                st.header("ILT Benchmark and Evidence")
+
+                st.write(
+                    "A single DDR usually cannot establish a defensible "
+                    "ILT benchmark on its own. Use comparable operation "
+                    "records or another documented reference."
+                )
+
+                evidence = st.text_area(
+                    "Document the benchmark, source, and justification",
+                    placeholder=(
+                        "Describe the comparable operations, benchmark "
+                        "duration, reference records, and justification."
+                    )
+                )
+
+                ilt = st.number_input(
+                    "Potential ILT (hours)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.25
+                )
+
+                if evidence.strip():
+
+                    tdlt = npt + ilt
+
+                    st.header("Unified Lost Time Result")
+
+                    x, y, z = st.columns(3)
+                    x.metric("NPT (hours)", f"{npt:.2f}")
+                    y.metric("Potential ILT (hours)", f"{ilt:.2f}")
+                    z.metric("TDLT (hours)", f"{tdlt:.2f}")
+
+                    result = pd.DataFrame([{
+                        "Report_File": pdf.name,
+                        "Validated_NPT_hr": npt,
+                        "Potential_ILT_hr": ilt,
+                        "TDLT_hr": tdlt,
+                        "ILT_Benchmark_Evidence": evidence,
+                    }])
+
+                    st.dataframe(
+                        result,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.download_button(
+                        "Download TDLT Summary CSV",
+                        data=csv_bytes(result),
+                        file_name="drillsense_ddr_tdlt_summary.csv",
+                        mime="text/csv"
+                    )
+
+                    st.download_button(
+                        "Download Reviewed NPT Events CSV",
+                        data=csv_bytes(edited),
+                        file_name="drillsense_reviewed_npt.csv",
+                        mime="text/csv"
+                    )
+
+                else:
+                    st.info(
+                        "Enter documented benchmark evidence before "
+                        "finalizing the combined TDLT result."
+                    )
+
+        except Exception as error:
+            st.error(f"Could not read the PDF: {error}")
 
 
 st.divider()
+
 st.caption(
-    "DrillSense AI is a decision-support prototype. "
-    "Detected events, extracted durations, report totals, and "
-    "ILT baselines require verification against source records. "
-    "The application does not independently certify drilling "
-    "time-loss classifications."
+    "DrillSense AI is an FYP research prototype. Verify all source "
+    "records, time units, NPT durations, and benchmark assumptions "
+    "before interpreting results as field findings."
 )
