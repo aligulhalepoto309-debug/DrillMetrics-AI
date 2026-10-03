@@ -8,19 +8,13 @@ from pypdf import PdfReader
 st.set_page_config(
     page_title="DrillSense AI",
     page_icon="🛢️",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("🛢️ DrillSense AI")
-st.subheader("Unified Lost Time Quantification Matrix")
-st.caption("Drilling Performance & Lost Time Intelligence")
-st.info("Core equation: TDLT = NPT + ILT")
-
-st.write(
-    "DrillSense AI combines Non-Productive Time (NPT) and "
-    "Invisible Lost Time (ILT) in one matrix for drilling "
-    "performance analysis."
-)
+st.subheader("Unified Lost Time Quantification & Decision Support")
+st.caption("Drilling Performance and Lost Time Intelligence")
+st.info("TDLT = NPT + ILT")
 
 REQUIRED = [
     "Well_ID",
@@ -38,18 +32,95 @@ KEYWORDS = [
     "repair", "leak", "stalled", "plugged",
     "damage", "unable to", "power tong",
     "top drive", "motor failure", "motor/vfd",
-    "motor vfd", "npt"
+    "motor vfd", "npt",
 ]
+
+# ---------------------------------------------------------
+# ROOT CAUSE CATEGORIES AND SUGGESTED REMEDIES
+# These are preliminary rules, not confirmed diagnoses.
+# ---------------------------------------------------------
+
+CAUSES = {
+    "Equipment malfunction": {
+        "keywords": [
+            "power tong", "top drive", "motor failure",
+            "motor/vfd", "motor vfd", "malfunction",
+            "equipment failure", "equipment problem",
+            "mechanical failure", "breakdown", "pump failure",
+        ],
+        "remedy": (
+            "Inspect the affected equipment and associated systems. "
+            "Review maintenance history, fault logs, spare-parts "
+            "availability, and the approved repair procedure."
+        ),
+    },
+    "Lost circulation / fluid loss": {
+        "keywords": [
+            "lost circulation", "loss circulation",
+            "lost returns", "loss of returns", "mud loss",
+        ],
+        "remedy": (
+            "Review mud properties, loss intervals, formation "
+            "conditions, and fluid-loss records. Evaluate suitable "
+            "loss-control measures under the approved drilling programme."
+        ),
+    },
+    "Stuck pipe / restricted movement": {
+        "keywords": [
+            "stuck pipe", "pipe stuck", "stuck drillstring",
+            "differential sticking", "pack off", "pack-off",
+        ],
+        "remedy": (
+            "Review hole-cleaning records, drilling parameters, "
+            "wellbore conditions, and the sequence preceding the event. "
+            "Follow the approved stuck-pipe response procedure."
+        ),
+    },
+    "Washout / leakage": {
+        "keywords": [
+            "washout", "leak", "leakage", "fluid leak",
+        ],
+        "remedy": (
+            "Inspect the affected component and connections. Verify "
+            "pressure-test and maintenance records, identify the leak "
+            "location, and follow the approved repair and testing procedure."
+        ),
+    },
+    "Fishing / recovery operation": {
+        "keywords": [
+            "fishing", "fish in hole", "lost tool",
+            "retrieval operation",
+        ],
+        "remedy": (
+            "Review the incident timeline, fish description, and "
+            "previous recovery attempts. Evaluate the approved fishing "
+            "programme and confirm equipment readiness."
+        ),
+    },
+    "Operational delay": {
+        "keywords": [
+            "waiting on", "unable to proceed", "operational delay",
+            "waiting for", "delay in operation",
+        ],
+        "remedy": (
+            "Verify the reason and duration of the delay. Review "
+            "personnel, materials, service coordination, and operational "
+            "planning to identify practical opportunities for improvement."
+        ),
+    },
+}
 
 
 def read_pdf(uploaded_file):
     reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
-    pages = []
+    parts = []
+
     for number, page in enumerate(reader.pages, start=1):
-        pages.append(
+        parts.append(
             f"PAGE {number}\n{page.extract_text() or ''}"
         )
-    return "\n".join(pages)
+
+    return "\n".join(parts)
 
 
 def detect_incidents(text):
@@ -66,37 +137,38 @@ def detect_incidents(text):
         if not any(k in line.lower() for k in KEYWORDS):
             continue
 
-        context = " | ".join(
+        evidence = " | ".join(
             lines[max(0, i - 1):min(len(lines), i + 2)]
         )
 
-        if context in seen:
+        if evidence in seen:
             continue
-        seen.add(context)
 
+        seen.add(evidence)
         duration = 0.0
 
         hour_match = re.search(
             r"(\d+(?:\.\d+)?)\s*(?:hours|hour|hrs|hr)\b",
-            context,
-            re.IGNORECASE
+            evidence,
+            re.IGNORECASE,
         )
 
         time_match = re.search(
             r"(\d{1,2}:\d{2})\s*(?:to|-)\s*(\d{1,2}:\d{2})",
-            context,
-            re.IGNORECASE
+            evidence,
+            re.IGNORECASE,
         )
 
         if hour_match:
             duration = float(hour_match.group(1))
+
         elif time_match:
-            def minutes(value):
+            def to_minutes(value):
                 h, m = map(int, value.split(":"))
                 return h * 60 + m
 
-            start = minutes(time_match.group(1))
-            end = minutes(time_match.group(2))
+            start = to_minutes(time_match.group(1))
+            end = to_minutes(time_match.group(2))
 
             if end < start:
                 end += 24 * 60
@@ -105,11 +177,31 @@ def detect_incidents(text):
 
         incidents.append({
             "Confirm as NPT": False,
-            "Incident / Evidence": context,
+            "Incident / Evidence": evidence,
             "Duration (hours)": duration,
         })
 
     return incidents
+
+
+def classify_cause(evidence):
+    text = str(evidence).lower()
+
+    for category, details in CAUSES.items():
+        if any(keyword in text for keyword in details["keywords"]):
+            return category
+
+    return "Unclassified - requires review"
+
+
+def recommend_remedy(category):
+    if category in CAUSES:
+        return CAUSES[category]["remedy"]
+
+    return (
+        "Review the original DDR and consult the drilling team. "
+        "Confirm the event mechanism before selecting a corrective action."
+    )
 
 
 def calculate_matrix(data):
@@ -118,7 +210,9 @@ def calculate_matrix(data):
     for col in ["Actual_Duration_hr", "Validated_NPT_hr"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if df[["Actual_Duration_hr", "Validated_NPT_hr"]].isna().any().any():
+    if df[
+        ["Actual_Duration_hr", "Validated_NPT_hr"]
+    ].isna().any().any():
         raise ValueError(
             "Actual_Duration_hr and Validated_NPT_hr must contain numbers."
         )
@@ -133,27 +227,23 @@ def calculate_matrix(data):
         df["Validated_NPT_hr"] > df["Actual_Duration_hr"]
     ).any():
         raise ValueError(
-            "NPT cannot exceed the actual operation duration."
+            "Validated NPT cannot exceed actual operation duration."
         )
 
-    # Remove validated NPT before estimating excess operation time.
     df["Adjusted_Duration_hr"] = (
         df["Actual_Duration_hr"] - df["Validated_NPT_hr"]
     )
 
-    # Benchmark comparable operations by operation type and hole section.
     df["Benchmark_Duration_hr"] = (
         df.groupby(["Operation_Type", "Hole_Section"])
         ["Adjusted_Duration_hr"]
         .transform("median")
     )
 
-    # Potential ILT is adjusted duration above the benchmark.
     df["Potential_ILT_hr"] = (
         df["Adjusted_Duration_hr"] - df["Benchmark_Duration_hr"]
     ).clip(lower=0)
 
-    # Unified total.
     df["TDLT_hr"] = (
         df["Validated_NPT_hr"] + df["Potential_ILT_hr"]
     )
@@ -165,28 +255,110 @@ def csv_bytes(data):
     return data.to_csv(index=False).encode("utf-8")
 
 
-# ======================================================
-# WORKFLOW 1: UNIFIED MATRIX FROM CSV / EXCEL
-# ======================================================
+def show_root_cause_analysis(evidence_data):
+    st.header("Root-Cause Analysis & Remedy Recommendations")
 
-st.header("1. Unified NPT–ILT Matrix")
+    st.write(
+        "The system suggests preliminary cause categories from the "
+        "recorded evidence. Review and correct every suggestion before "
+        "using it in engineering decisions."
+    )
+
+    analyzed = evidence_data.copy()
+
+    if "Incident / Evidence" not in analyzed.columns:
+        st.info(
+            "This dataset does not contain an incident-evidence column. "
+            "Root-cause classification requires event descriptions or "
+            "DDR evidence; it cannot be reliably inferred from duration "
+            "values alone."
+        )
+        return
+
+    analyzed["Suggested Cause"] = analyzed[
+        "Incident / Evidence"
+    ].apply(classify_cause)
+
+    analyzed["Suggested Remedy"] = analyzed[
+        "Suggested Cause"
+    ].apply(recommend_remedy)
+
+    analyzed["Reviewed Cause"] = analyzed["Suggested Cause"]
+
+    edited = st.data_editor(
+        analyzed,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "Reviewed Cause": st.column_config.SelectboxColumn(
+                "Reviewed Cause",
+                options=list(CAUSES.keys()) + [
+                    "Unclassified - requires review",
+                    "Other - manual review",
+                ],
+                required=True,
+            ),
+            "Suggested Cause": st.column_config.TextColumn(
+                "System-suggested category",
+                disabled=True,
+            ),
+            "Suggested Remedy": st.column_config.TextColumn(
+                "Suggested remedy",
+                disabled=True,
+            ),
+        },
+    )
+
+    # Recompute the remedy from the reviewer's chosen category.
+    edited["Final Remedy"] = edited["Reviewed Cause"].apply(
+        recommend_remedy
+    )
+
+    st.subheader("Reviewed root-cause and remedy table")
+    st.dataframe(
+        edited,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "Download root-cause analysis (CSV)",
+        data=csv_bytes(edited),
+        file_name="drillsense_root_cause_analysis.csv",
+        mime="text/csv",
+    )
+
+
+# =========================================================
+# MAIN WORKFLOW SELECTION
+# =========================================================
+
+st.header("1. Select Data Source")
 
 mode = st.radio(
-    "Choose your workflow",
-    ["Operation Dataset (CSV / Excel)", "DDR PDF Review"],
-    horizontal=True
+    "Choose workflow",
+    [
+        "Operation Dataset (CSV / Excel)",
+        "DDR PDF Review",
+    ],
+    horizontal=True,
 )
+
+# =========================================================
+# WORKFLOW A: OPERATION DATASET
+# =========================================================
 
 if mode == "Operation Dataset (CSV / Excel)":
 
     uploaded = st.file_uploader(
-        "Upload your operation dataset",
-        type=["csv", "xlsx"]
+        "Upload operation dataset",
+        type=["csv", "xlsx"],
     )
 
     st.caption(
         "Required columns: Well_ID, Report_Date, Operation_Type, "
-        "Hole_Section, Actual_Duration_hr, Validated_NPT_hr"
+        "Hole_Section, Actual_Duration_hr, Validated_NPT_hr."
     )
 
     if uploaded is not None:
@@ -200,8 +372,7 @@ if mode == "Operation Dataset (CSV / Excel)":
 
             if missing:
                 st.error(
-                    "The dataset is missing required columns: "
-                    + ", ".join(missing)
+                    "Missing required columns: " + ", ".join(missing)
                 )
                 st.write("Columns detected:", list(raw.columns))
                 st.dataframe(raw.head(50), use_container_width=True)
@@ -215,22 +386,21 @@ if mode == "Operation Dataset (CSV / Excel)":
                 )
 
             else:
-                is_synthetic = (
+                synthetic = (
                     "Source_Reference" in raw.columns
                     and "Review_Status" in raw.columns
                 )
 
-                if is_synthetic:
+                if synthetic:
                     st.warning(
-                        "SYNTHETIC DEMONSTRATION MODE: These records "
-                        "are simulated. Results do not represent actual "
-                        "field performance or validated Lower Indus "
-                        "Basin measurements."
+                        "SYNTHETIC DEMONSTRATION MODE: the data is "
+                        "simulated and does not establish actual field "
+                        "performance or validated Lower Indus Basin results."
                     )
                 else:
                     st.info(
-                        "Structured data detected. Verify source records, "
-                        "time units, NPT labels, and benchmark suitability."
+                        "Structured data detected. Verify the source, "
+                        "units, NPT labels, and benchmark suitability."
                     )
 
                 matrix = calculate_matrix(raw)
@@ -238,7 +408,7 @@ if mode == "Operation Dataset (CSV / Excel)":
                 if "Review_Status" not in matrix.columns:
                     matrix["Review_Status"] = "Requires verification"
 
-                st.header("2. Filter the Matrix")
+                st.header("2. Filter Operation Records")
 
                 col1, col2, col3 = st.columns(3)
 
@@ -251,57 +421,51 @@ if mode == "Operation Dataset (CSV / Excel)":
                 )
 
                 with col1:
-                    chosen_wells = st.multiselect(
+                    selected_wells = st.multiselect(
                         "Well",
                         wells,
-                        default=wells
+                        default=wells,
                     )
 
                 with col2:
-                    chosen_operations = st.multiselect(
+                    selected_operations = st.multiselect(
                         "Operation",
                         operations,
-                        default=operations
+                        default=operations,
                     )
 
                 with col3:
-                    chosen_sections = st.multiselect(
+                    selected_sections = st.multiselect(
                         "Hole section",
                         sections,
-                        default=sections
+                        default=sections,
                     )
 
                 view = matrix[
-                    matrix["Well_ID"].astype(str).isin(chosen_wells)
+                    matrix["Well_ID"].astype(str).isin(selected_wells)
                     & matrix["Operation_Type"].astype(str).isin(
-                        chosen_operations
+                        selected_operations
                     )
                     & matrix["Hole_Section"].astype(str).isin(
-                        chosen_sections
+                        selected_sections
                     )
                 ].copy()
 
-                st.header("3. Lost Time Results")
+                st.header("3. Unified Lost Time Summary")
 
                 npt_total = view["Validated_NPT_hr"].sum()
                 ilt_total = view["Potential_ILT_hr"].sum()
                 tdlt_total = view["TDLT_hr"].sum()
 
                 a, b, c, d = st.columns(4)
-                a.metric("Operation Records", len(view))
-                b.metric("NPT (hours)", f"{npt_total:.2f}")
-                c.metric("Potential ILT (hours)", f"{ilt_total:.2f}")
-                d.metric("TDLT (hours)", f"{tdlt_total:.2f}")
+                a.metric("Records", len(view))
+                b.metric("NPT (hr)", f"{npt_total:.2f}")
+                c.metric("Potential ILT (hr)", f"{ilt_total:.2f}")
+                d.metric("TDLT (hr)", f"{tdlt_total:.2f}")
 
-                st.caption(
-                    "Potential ILT is benchmark-based and requires "
-                    "technical review. It is not automatically proof "
-                    "that all excess time was avoidable."
-                )
+                st.header("4. Unified NPT–ILT Matrix")
 
-                st.header("4. Unified Quantification Matrix")
-
-                display_cols = [
+                columns = [
                     "Well_ID",
                     "Report_Date",
                     "Operation_Type",
@@ -315,14 +479,12 @@ if mode == "Operation Dataset (CSV / Excel)":
                     "Review_Status",
                 ]
 
-                display_cols = [
-                    c for c in display_cols if c in view.columns
-                ]
+                columns = [c for c in columns if c in view.columns]
 
                 st.dataframe(
-                    view[display_cols].round(2),
+                    view[columns].round(2),
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
                 )
 
                 st.header("5. Calculation Method")
@@ -331,20 +493,17 @@ if mode == "Operation Dataset (CSV / Excel)":
                     r"\text{Adjusted Duration} = "
                     r"\text{Actual Duration} - \text{NPT}"
                 )
-
                 st.latex(
                     r"\text{Potential ILT} = "
                     r"\max(0,\text{Adjusted Duration} - \text{Benchmark})"
                 )
+                st.latex(r"\text{TDLT} = \text{NPT} + \text{Potential ILT}")
 
-                st.latex(
-                    r"\text{TDLT} = \text{NPT} + \text{Potential ILT}"
-                )
-
-                st.write(
+                st.caption(
                     "The benchmark is the median adjusted duration "
-                    "for records with the same operation type and "
-                    "hole section in the uploaded dataset."
+                    "for each operation type and hole section. Potential "
+                    "ILT requires technical review and may reflect "
+                    "legitimate operational differences."
                 )
 
                 st.header("6. Operation Summary")
@@ -352,7 +511,7 @@ if mode == "Operation Dataset (CSV / Excel)":
                 summary = (
                     view.groupby(
                         ["Operation_Type", "Hole_Section"],
-                        as_index=False
+                        as_index=False,
                     )
                     .agg(
                         Record_Count=("Well_ID", "count"),
@@ -366,53 +525,88 @@ if mode == "Operation Dataset (CSV / Excel)":
                 st.dataframe(
                     summary.round(2),
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
                 )
 
                 if not summary.empty:
-                    chart = summary.set_index("Operation_Type")[
-                        ["Validated_NPT_hr", "Potential_ILT_hr"]
-                    ]
-                    st.bar_chart(chart)
+                    st.bar_chart(
+                        summary.set_index("Operation_Type")[
+                            ["Validated_NPT_hr", "Potential_ILT_hr"]
+                        ]
+                    )
 
-                st.header("7. Download Results")
+                st.header("7. Root-Cause Analysis")
+
+                evidence_columns = [
+                    "Incident / Evidence",
+                    "Incident",
+                    "Event_Description",
+                    "Description",
+                    "Event",
+                ]
+
+                evidence_col = next(
+                    (
+                        c for c in evidence_columns
+                        if c in view.columns
+                    ),
+                    None,
+                )
+
+                if evidence_col:
+                    cause_input = view.copy()
+                    if evidence_col != "Incident / Evidence":
+                        cause_input["Incident / Evidence"] = (
+                            cause_input[evidence_col]
+                        )
+                    show_root_cause_analysis(cause_input)
+                else:
+                    st.info(
+                        "Your operation dataset has no event-description "
+                        "column, so root causes cannot be reliably inferred "
+                        "from the operation durations alone. Use DDR PDF "
+                        "Review to classify documented incidents, or add "
+                        "an Incident / Evidence column to your dataset."
+                    )
+
+                st.header("8. Download Results")
 
                 st.download_button(
                     "Download Unified Matrix CSV",
                     data=csv_bytes(view),
                     file_name="drillsense_unified_matrix.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
 
                 st.download_button(
                     "Download Operation Summary CSV",
                     data=csv_bytes(summary),
                     file_name="drillsense_operation_summary.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
 
         except Exception as error:
             st.error(f"Could not process the dataset: {error}")
 
 
-# ======================================================
-# WORKFLOW 2: DDR PDF REVIEW
-# ======================================================
+# =========================================================
+# WORKFLOW B: DDR PDF REVIEW
+# =========================================================
 
 else:
 
-    st.header("DDR PDF Incident Review")
+    st.header("DDR Incident Review")
 
     pdf = st.file_uploader(
-        "Upload a Daily Drilling Report PDF",
-        type=["pdf"]
+        "Upload Daily Drilling Report PDF",
+        type=["pdf"],
     )
 
     if pdf is not None:
         try:
             text = read_pdf(pdf)
 
-            with st.expander("View extracted PDF text"):
+            with st.expander("View extracted report text"):
                 st.text(text[:20000])
 
             incidents = detect_incidents(text)
@@ -420,13 +614,13 @@ else:
             if not incidents:
                 st.warning(
                     "No potential incidents were automatically detected. "
-                    "This does not prove that the report contains no NPT. "
-                    "Review the extracted text manually."
+                    "Review the extracted report text manually."
                 )
 
             else:
                 st.write(
-                    "Review every detected event against the original DDR."
+                    "Confirm each event and verify its duration "
+                    "against the original DDR."
                 )
 
                 review = pd.DataFrame(incidents)
@@ -443,9 +637,9 @@ else:
                         "Duration (hours)": st.column_config.NumberColumn(
                             "Duration (hours)",
                             min_value=0.0,
-                            step=0.25
+                            step=0.25,
                         ),
-                    }
+                    },
                 )
 
                 confirmed = edited[
@@ -454,7 +648,7 @@ else:
 
                 confirmed["Duration (hours)"] = pd.to_numeric(
                     confirmed["Duration (hours)"],
-                    errors="coerce"
+                    errors="coerce",
                 )
 
                 invalid = (
@@ -476,36 +670,34 @@ else:
                 st.header("ILT Benchmark and Evidence")
 
                 st.write(
-                    "A single DDR usually cannot establish a defensible "
-                    "ILT benchmark on its own. Use comparable operation "
-                    "records or another documented reference."
+                    "Use comparable operation records or another "
+                    "documented benchmark. Avoid double-counting NPT."
                 )
 
                 evidence = st.text_area(
-                    "Document the benchmark, source, and justification",
+                    "Document benchmark, source, and justification",
                     placeholder=(
-                        "Describe the comparable operations, benchmark "
-                        "duration, reference records, and justification."
-                    )
+                        "Describe the comparable operation, reference "
+                        "duration, source records, and justification."
+                    ),
                 )
 
                 ilt = st.number_input(
                     "Potential ILT (hours)",
                     min_value=0.0,
                     value=0.0,
-                    step=0.25
+                    step=0.25,
                 )
 
                 if evidence.strip():
-
                     tdlt = npt + ilt
 
                     st.header("Unified Lost Time Result")
 
                     x, y, z = st.columns(3)
-                    x.metric("NPT (hours)", f"{npt:.2f}")
-                    y.metric("Potential ILT (hours)", f"{ilt:.2f}")
-                    z.metric("TDLT (hours)", f"{tdlt:.2f}")
+                    x.metric("NPT (hr)", f"{npt:.2f}")
+                    y.metric("Potential ILT (hr)", f"{ilt:.2f}")
+                    z.metric("TDLT (hr)", f"{tdlt:.2f}")
 
                     result = pd.DataFrame([{
                         "Report_File": pdf.name,
@@ -518,21 +710,21 @@ else:
                     st.dataframe(
                         result,
                         use_container_width=True,
-                        hide_index=True
+                        hide_index=True,
                     )
 
                     st.download_button(
                         "Download TDLT Summary CSV",
                         data=csv_bytes(result),
                         file_name="drillsense_ddr_tdlt_summary.csv",
-                        mime="text/csv"
+                        mime="text/csv",
                     )
 
                     st.download_button(
                         "Download Reviewed NPT Events CSV",
                         data=csv_bytes(edited),
                         file_name="drillsense_reviewed_npt.csv",
-                        mime="text/csv"
+                        mime="text/csv",
                     )
 
                 else:
@@ -541,14 +733,27 @@ else:
                         "finalizing the combined TDLT result."
                     )
 
+                st.header("Root-Cause Analysis & Remedy Recommendations")
+
+                cause_data = edited[
+                    edited["Confirm as NPT"] == True
+                ].copy()
+
+                if not cause_data.empty:
+                    show_root_cause_analysis(cause_data)
+                else:
+                    st.info(
+                        "Confirm at least one event as NPT to begin "
+                        "reviewing root causes and remedies."
+                    )
+
         except Exception as error:
             st.error(f"Could not read the PDF: {error}")
 
 
 st.divider()
-
 st.caption(
-    "DrillSense AI is an FYP research prototype. Verify all source "
-    "records, time units, NPT durations, and benchmark assumptions "
-    "before interpreting results as field findings."
+    "Research prototype: automated categories are preliminary suggestions. "
+    "Verify source evidence and technical recommendations before use. "
+    "Synthetic results do not represent validated field performance."
 )
